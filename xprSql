@@ -1,0 +1,789 @@
+#!/bin/sh
+
+PROGNAME=`basename $0`
+DBP=${DBAS_PATH:-${AVPATH:-/usr/airviro/}data/${AVDBNAME:-data}/}
+PROT=`expr $PROGNAME : 'xpr\([^.]*\)'`
+
+#exec 2>/usr/airviro/log/${PROGNAME%.*}.log; set -x
+
+function SUBSTR
+{
+  Parm1=$1
+  Parm2=$2
+  Parm3=$3
+  echo "${Parm1:Parm2:Parm3}"
+}
+
+Help() {
+    $ECHO "Usage: $PROGNAME [-lsad] [-D actions] [-e ENDTIME] DEVICE SSS STARTTIME"
+    $ECHO "       $PROGNAME {-h | -V | -L | -A SSS | -S SSS}"
+    if [ $# -eq 0 ]; then
+	return
+    fi
+    cat <<-!
+
+	 -h		Show this help.
+	 -s		Save raw data files in \$DBAS_PATH/raw/SSS.
+        	Only for RECEIVE operation mode.
+	 -l		Save logfile in \$DBAS_PATH/stn/SSS.log
+	 -a		Get data by valuedb instead by distribution.
+        	Only for SEND operation mode.
+	 -d		Debug mode. Show execution of script on stderr.
+	 -e		End pointer for data collection. YYMMDDHHmm
+	 -D actions	Only do specified actions. Default is 'fsr':
+	 	f	  Fetch data on standard format to tmp folder.
+	 	D	  Show fetched data to stdout.
+	 	s	  Send converted data to destiny.
+	 	r	  Cleanup.
+		
+	 -V		Verify installation of protocol.
+	 -L		List unique files for protocol for active airviro domain.
+	 -A SSS		Ignored for this protocol.
+	 -S SSS		Ignored for this protocol.
+	 device		Device to use. Not used for this protocol.
+	 SSS		Station id to collect data.
+	 starttime	Start pointer for data collection.
+	!
+    exit 0
+}
+
+action() {
+    if [ -z "$2" ]; then
+        return 0
+    fi
+    pos=`expr index "$2" "$1"`
+    if [ "$pos" -eq 0 ]; then
+        return 1
+    fi
+    return 0
+}
+
+AtExit() {
+    unset Verify
+    unset List
+    unset Help
+    exit $EXITCODE
+}
+
+List() {
+    BINDIR=${AVPATH:-/usr/airviro/}bin/
+    
+    cat <<-EOL
+	${DBP}stn/xpr$PROT.cfg
+	${BINDIR}xpr$PROT
+	${BINDIR}sqlreceive
+	${BINDIR}sqlsend
+	${BINDIR}sqlcommon.py
+	${BINDIR}queryMSSQL.php
+	EOL
+    exit 0
+}
+
+Verify() {
+    BASE=${BINDIR:-${AVPATH:-/usr/airviro/}bin/}..
+    cd $BASE
+    rc=0
+    TST="-f"
+    MSG="does not exist"
+    
+    while read FILE
+	do
+        if [ "`expr \"$FILE\"  : '\(.\).*'`"  = '-' ] ; then
+            TST=`expr "$FILE" : '\(.*\)#.*'`
+            MSG=`expr "$FILE" : '.*#\(.*\)'`
+        elif [ ! $TST $FILE ]; then
+            $ECHO $FILE $MSG
+            rc=1
+        fi
+    done <<-EOL 
+	${DBP}stn/xpr$PROT.cfg
+	bin/sqlcommon.py
+	bin/queryMSSQL.php
+	-x#is not executable
+	bin/xpr$PROT
+	bin/sqlreceive
+	bin/sqlsend
+	bin/spoolmerge
+	EOL
+	
+    
+    if [ $rc -eq 0 ]; then
+        $ECHO "All Files OK"
+    fi
+    exit $rc 
+}
+
+AlternativeFetch()
+{
+    DebugMsg "AlternativeFetch"
+    EXITCODE=3
+    
+    VALUEDBFILES="$STN.valuedb.tmp.*"
+    rm -f $VALUEDBFILES
+    
+    SUBSFILE=$STN.Subs.tmp
+    /usr/airviro/bin/getxpr -l $PROT $STN.Sent | \
+        awk -F: '{ split($1, field, ".");  secfield=$2; if(NF>2){for(i=3;i<=NF;i++){secfield = secfield FS $i}}; unit="-"; split(secfield,vfield,"#"); if(vfield[2]~/\[*\]/){split(vfield[2],vunit,"]");unit=vunit[1]"]";} print field[3], field[2], unit, vfield[1]}' | \
+	awk '{print $1, $2, $3, $4, $5}' > $SUBSFILE
+	
+    SOMESUBSOK=0
+    while read line
+    do 
+        FIELDS=( $line )
+        ACTUALSUBS=${FIELDS[0]}
+        ACTUALRES=${FIELDS[1]}
+	ACTUALUNIT=${FIELDS[2]}
+        ACTUALSTN=${FIELDS[3]}
+        ACTUALCHANNEL=${FIELDS[4]}
+        
+        if [ "$ACTUALSTN" = "%" -o "$ACTUALRES" = "%" -o \
+             "$ACTUALCHANNEL" = "%" ]
+        then
+            ErrorMsg "CFG: Implicit declaration of Subs $ACTUALSUBS don't supported. Abort"
+            EXSTR=`$ECHO "Cfg\nImplicit declaration don't supported"`
+            return
+        fi
+        
+	VUNIT=""
+	if [ $ACTUALUNIT != "-" ]; then
+            VUNIT=$ACTUALUNIT
+	fi
+		
+	CFGRES=$(/usr/airviro/bin/getxpr $PROT $STN TimeRes.$ACTUALRES)
+	if [ $? -lt 1 ]; then
+            ErrorMsg "CFG: TimeRes $ACTUALRES not defined"
+            EXSTR=`$ECHO "Cfg\nTimeRes '$ACTUALRES' not defined"`
+            return
+	fi
+		
+        case $CFGRES in
+            60) ACTUALAVRES=',' ;;
+            300) ACTUALAVRES='f' ;;
+            600) ACTUALAVRES='t' ;;
+            900) ACTUALAVRES='q' ;;
+            1200) ACTUALAVRES='i' ;;
+            1800) ACTUALAVRES='s' ;;
+            3600) ACTUALAVRES='+' ;;
+            86400) ACTUALAVRES='*' ;;
+            *)  ErrorMsg "CFG: Resolution '$CFGRES' don't supported in Subs $ACTUALSUBS. Abort"
+		EXSTR=`$ECHO "Cfg\nResolution '$CFGRES' don't supported"`
+            return
+            ;;
+        esac
+        
+        VALUEDBFILE="$STN.valuedb.tmp.$ACTUALSUBS"
+        STRVALUEDB="$STARTTIME $ENDTIME 1\n${ACTUALSTN}${ACTUALAVRES}${ACTUALCHANNEL} 9 $VUNIT"
+        $ECHO $STRVALUEDB > $VALUEDBFILE
+        
+        valuedb -f "$VALUEDBFILE" -o "$STN.values.$ACTUALSUBS" -n
+        if [ $? -ne 0 ]; then
+            ErrorMsg "Get data with valuedb for Subs $ACTUALSUBS failed"
+	    EXSTR=`$ECHO "Xpr\nError getting data from valuedb"`
+            return
+        else
+            SOMESUBSOK=1
+        fi
+    done < $SUBSFILE
+    
+    if [ $SOMESUBSOK -eq 0 ]; then
+        NoticeMsg "NO DATA. No get Subs with data by valuedb"
+        EXITCODE=2
+        return
+    fi
+    
+    rm -f $SUBSFILE $VALUEDBFILES
+    
+    NoticeMsg "Data fetched"
+    EXITCODE=0
+}
+
+Fetch()
+{
+    DebugMsg "Fetch"
+    EXITCODE=3
+    
+echo " fecth:  " $A_OPT
+    if [ $A_OPT -eq 1 ]; then
+        AlternativeFetch
+        return
+    fi
+    
+    RECIPIENTS=`/usr/airviro/bin/getxpr -l $PROT $STN.recip | \
+                awk -F: '{print $2}'`
+    if [ "$RECIPIENTS" == "" ]; then
+        DebugMsg "No hay recip para $STN"
+        EXSTR=`$ECHO "Cfg\nNo recipients of distribution defined"`
+        return
+    fi
+    
+    DISTFILES=""
+    for RECIP in $RECIPIENTS
+    do
+        DISTDIR="${DBP}dist/${RECIP}"
+        if [ -d $DISTDIR ]; then
+            DISTFILES="$DISTFILES ${DISTDIR}/dist*.lha"
+        else
+            DebugMsg "distdir $DISTDIR don't exist"
+            EXSTR=`$ECHO "Cfg\nDon't exist distribution directory for '$RECIP'"`
+            return
+        fi
+    done
+    
+    mkdir -p $UNPACKDIR
+    if [ $? -ne 0 ]; then
+        DebugMsg "fail to create unpackdir $UNPACKDIR" 
+        EXSTR=`$ECHO "Xpr\nCan't create dir $UNPACKDIR"`
+        return
+    fi
+
+    SOMEUNPACKOK=0
+    for FILE in $DISTFILES
+    do
+        if [ -r $FILE ]; then
+            lha efw=$UNPACKDIR $FILE
+            if [ $? -ne 0 ]; then
+	        DebugMsg "lha fails to unpack file $FILE"
+                EXSTR=`$ECHO "Xpr\nCan't unpack lha archive $FILE"`
+                return
+            fi
+	    rm -f $FILE 2>/dev/null
+            SOMEUNPACKOK=1
+        fi
+    done
+
+    if [ $SOMEUNPACKOK -eq 0 ]; then
+        DebugMsg "NO DATA. No files for unpack"
+        EXITCODE=2
+        return
+    fi
+    DebugMsg "spool compression begins"
+    SFC=`ls -1tr $UNPACKDIR | wc -l`
+    ls -1tr $UNPACKDIR  | awk  -vpath=$UNPACKDIR/ '{print path$1}' | spoolmerge -f -o $STN.values. 1>/dev/null
+    ls -1tr $UNPACKDIR  | awk  -vpath=$UNPACKDIR/ '{print path$1}' | xargs rm -f
+    FFC=`ls -1tr | grep "$STN\.values\.*" -c`
+    DebugMsg "compress skipped $(($SFC-$FFC)) files."
+    DebugMsg "Fetched $FFC files."
+    NoticeMsg "Data Fetched"
+    EXITCODE=0
+}
+
+SafeSent() {
+   NoticeMsg "SafeSent"
+   BCKP=`ls -1tr | grep "$STN\.backup\.*" | wc -l`
+   J=`ls -1tr | grep "$STN\.values\.*" | wc -l`
+   let J++
+   for File in $(ls -1tvr | grep "$STN\.backup\.*")
+   do
+      mv $File $STN.values.$J
+      let J++
+   done
+   NoticeMsg "safesent rescue $BCKP files"
+   BCKP=0
+   SXRES=0
+   for File in $(ls -1tvr | grep "$STN\.values\.*")
+   do	
+      cp -f $File $STN.data.1
+      DebugMsg "safecall: $File $STN.data.1 -> sqlsend $PROT $STN"
+      TMPF=$(mktemp /tmp/$STN.tmp.XXXX)
+      RES=`sqlsend $PROT $STN `;
+      XRES=$?
+      DebugMsg "sqlsend output:  " 
+      while read line 
+      do
+         DebugMsg "== "$line
+      done < $TMPF
+      rm -f $TMPF
+      if [ "$XRES" -eq "0" ]; then
+	  DebugMsg "file sent OK -----"
+	  if [  "-$RES" != "-" ]; then
+		DebugMsg $RES
+	  fi
+	  rm -f $File
+      else
+	  if [ "$XRES" -gt "$SXRES" ]; then
+		SXRES=$XRES
+	  fi
+	  if [ "-$SRES" == "-" ]; then
+		SRES="$RES"
+	  else
+		SRES="$SRES\n$RES"
+	  fi
+	  DebugMsg "sent of file failed, backup. $RES"
+	  mv $File $STN.backup.$BCKP
+	  let BCKP++
+      fi
+   done
+   BCKP=`ls -1tr | grep "$STN\.backup\.*" | wc -l`
+   NoticeMsg "safesent backup $BCKP files"
+   echo " SRES salida de SafeSent:  "$SRES
+   echo " SXRES salida de SafeSent:  "$SXRES
+   exit $SXRES
+}
+
+Send() {
+    NoticeMsg "Send"
+    case $EXITCODE in
+    0)  ;;
+    *) 	DebugMsg "No data to Send";
+	return;;
+    esac
+	
+    DebugMsg "SafeSent $PROT $STN"
+    RES=`SafeSent $PROT $STN`;
+    
+    case $? in
+    0)
+        EXITCODE=0
+    ;;
+    1)
+        EXITCODE=1
+    ;;
+    2)
+        EXITCODE=2
+    ;;
+    3)
+        EXSTR=`$ECHO "Cfg\n$RES"`
+        EXITCODE=3
+    ;;
+    4)
+        EXSTR=`$ECHO "Stn\n$RES"`
+        EXITCODE=3
+    ;;
+    5)
+        EXSTR=`$ECHO "Cfg\n$RES"`
+        EXITCODE=3
+    ;;
+    *)
+        EXSTR=`$ECHO "Xpr\nMissing message."`
+        EXITCODE=3
+    ;;
+    esac
+    DebugMsg "Exit from send with code: $EXITCODE"
+    return $EXITCODE
+}
+
+Receive() {
+    DebugMsg "Receive data: $PROT $STN $STARTTIME"
+    DebugMsg "sqlreceive data: $PROT $STN $STARTTIME $ENDTIME"
+    TMPF=$(mktemp $STN.tmp.XXXX)
+    RES=`sqlreceive $PROT $STN $STARTTIME $ENDTIME 2>$TMPF`;
+    SQLREC=$?
+    DebugMsg "sqlreceive output:" 
+
+    while read line 
+    do
+       DebugMsg "== "$line
+    done < $TMPF
+    rm -f $TMPF
+
+    case $SQLREC in
+    0)
+        EXITCODE=0
+    ;;
+    1)
+        EXITCODE=1
+    ;;
+    2)
+        EXITCODE=2
+    ;;
+    3)
+        EXSTR=`$ECHO "Cfg\n$RES"`
+        EXITCODE=3
+    ;;
+    4)
+        EXSTR=`$ECHO "Stn\n$RES"`
+        EXITCODE=3
+    ;;
+    5)
+        EXSTR=`$ECHO "Cfg\n$RES"`
+        EXITCODE=3
+    ;;
+    6)
+	EXSTR="$RES"
+	EXITCODE=3
+	;;
+    *)
+        EXSTR=`$ECHO "Xpr\nMissing message."`
+        EXITCODE=3
+    ;;
+    esac
+	
+    DebugMsg "Exit from sqlreceive with code: $EXITCODE"
+    return $EXITCODE
+}
+
+Spool()
+{
+    case $EXITCODE in
+    0|1);;
+    *) DebugMsg "No data to spool";
+	return;; 	
+    esac
+    
+    DebugMsg "Spooling data"
+    rm -f ${STN}.tst
+    SPOOLDATAOK=3
+    SOMESPOOLDATAFAIL=1
+	
+    for FILE in $DATAFILES
+    do
+        if [ -r $FILE ]; then
+            SPOOLDATAOK=2
+        fi
+    done
+    
+    if [ $SPOOLDATAOK -eq 3 ]; then
+       NoticeMsg "No data for spool"
+       exit
+    fi
+	
+    for FILE in $DATAFILES
+    do
+        cp $FILE /tmp/xprSql.file
+        cp $FILE /tmp/Sql.file
+	FILEDB=$($ECHO $FILE | awk -F. '{print $3}')
+	ZONENAME=`/usr/airviro/bin/getxpr $PROT database $FILEDB.Zone`
+	case $? in
+	0) DebugMsg "Database.$FILEDB.Zone not defined"
+		ZONENAME=""
+		;;
+	-1|255) ErrorMsg "error al obtener Database.$FILEDB.Zone: $ZONENAME"
+		EXSTR=`$ECHO "Cfg\nError getting Database.$FILEDB.Zone"`
+		EXITCODE=3
+		;;
+	esac
+	ZSHIFT=0
+	if [ "$ZONENAME" != "" ]; then
+		DebugMsg "Using TimeZone from DataBase '$ZONENAME'"
+		LTIME=$(date +"%s")
+		ZTIME=$(date -d "$(/usr/sbin/zdump $ZONENAME | awk '{print $3, $4, $5, $6}')" +"%s")
+		let ZSHIFT=LTIME-ZTIME
+		DebugMsg "Zone difference: $ZSHIFT"
+	fi
+	TSHIFT=`/usr/airviro/bin/getxpr $PROT database $FILEDB.RcptShift`
+#	DebugMsg "Using Shift in Database  '$TSHIFT'"
+	case $? in
+	0) DebugMsg "Database.$FILEDB.RcptShift not defined"
+		TSHIFT=0;;
+	-1|255) ErrorMsg "error al obtener Database.$FILEDB.RcptShift: $TSHIFT"
+		EXSTR=`$ECHO "Cfg\nError getting Database.$FILEDB.RcptShift"`
+		EXITCODE=3
+		;;
+	esac
+	TDIFF=0
+        let TDIFF=TSHIFT+ZSHIFT
+        let MINDIFF=TDIFF/60 
+	DebugMsg "Appliying $TDIFF seconds or $MINDIFF  min of time diff to data station"
+        TMP=`rawrdstd $FILE -S $TDIFF 2>/dev/null`
+        if [ $? -eq 0 ]; then
+            UPDATE=`expr "$TMP"  : '\(.*\) was.*'`
+	    UETIME=$(mkstrftime "%${UPDATE:0:2}y%${UPDATE:2:2}m%${UPDATE:4:2}d%${UPDATE:6:2}H%${UPDATE:8:2}M%00S" "%s")
+	    let UETIMEP=UETIME+TDIFF
+	    UPDATE=$(mkstrftime "%y%m%d%H%M" -t $UETIMEP)
+	    DebugMsg "Last Data Updated is $UPDATE "
+            $ECHO $UPDATE >>${STN}.tst
+            SPOOLDATAOK=0
+        else
+	    DebugMsg "Spool data fail: $FILE"
+            SOMESPOOLDATAFAIL=0
+        fi
+    done
+    
+    UPDATE=`cat $STN.tst | sort | head -1`   
+    rm -f ${STN}.tst
+	
+    if [ $SPOOLDATAOK -eq 3 ]; then
+        NoticeMsg "No data for spool"
+    elif [ $SPOOLDATAOK -eq 2 ]; then
+        ErrorMsg "FATAL ERROR: Failed to spool data."
+        EXSTR=`$ECHO "Stn\nFailed to spool data."`
+        EXITCODE=3
+    elif [ $SOMESPOOLDATAFAIL -eq 0 ]; then
+        NoticeMsg "Spool process partially OK."
+        EXITCODE=1
+    elif [ $SPOOLDATAOK -eq 0 ]; then
+        DebugMsg "Spool process OK"
+        EXITCODE=0
+    fi
+}
+
+ShowData()
+{
+    case $EXITCODE in
+    0|1) ;;
+    *) return;;
+    esac
+    
+    $ECHO "Show data:\n---------------------------------"
+    for FILE in $DATAFILES
+    do
+        if [ -r "$FILE" ]; then
+            cat "$FILE"
+            $ECHO "\n---------------------------------"
+        fi
+    done
+}
+
+SaveRawData() {
+    case $EXITCODE in
+    0|1) ;;
+    *) return;;
+    esac
+
+    DebugMsg "Saving raw data"
+    
+    mkdir -p $DBP/raw/$STN
+    
+    TIME_STR=`date +%y%m%d%H\%M`
+
+    for TMPFILE in $DATAFILES $RAWDATAFILES
+    do
+        if [ -r "$TMPFILE" ]; then
+            SAVEFILE=${DBP}raw/$STN/$TIME_STR.$TMPFILE
+            cp -pf $TMPFILE $SAVEFILE
+            gzip -f $SAVEFILE
+            if [ $? -eq 0 ]; then
+                DebugMsg "$SAVEFILE.gz saved"
+            fi
+        fi
+    done
+}
+
+Cleanup() {
+    DebugMsg "Cleaning up"
+   
+    if [ -r "$STN.tmp" ]; then
+        grep '^AVLOG> ' $STN.tmp | cut -c8- | $AVLOG >/dev/null 2>&1
+    fi
+
+    if [ $L_OPT -eq 1 -a -r "$STN.tmp" ]; then
+    {
+        cat $STN.tmp
+        $ECHO "-------------------------------------"
+    } >> $LOGFILE
+    fi
+    
+    case $EXITCODE in
+    0|2)
+        rm -f $TMPFILES  2>/dev/null
+        rm -f -R $UNPACKDIR  2>/dev/null
+        ;;
+    *)
+        return
+        ;;
+    esac
+}
+
+DebugMsg() {
+  if [ $DEBUG_LVL -gt 1 ]
+	then
+		$ECHO "DBG: " $* >&2
+	fi
+}
+
+NoticeMsg() {
+	if [ $DEBUG_LVL -gt 0 ]
+	then
+		$ECHO "NTC: " $* >&2
+	fi
+}
+
+ErrorMsg () {
+	$ECHO "ERR: " $* >&2
+}
+
+INIT_TIME=`date +"%s"`
+DEBUG_LVL=0
+
+trap AtExit 0 1 2 15
+
+tty -s
+if [ $? -eq 1 ]; then
+    AVLOG="avlog -i"
+    terminal=0
+else
+    AVLOG="tee /dev/tty"
+    terminal=1
+fi
+
+set -- `getopt hsladLVe:D:A:S: $*`
+if [ $? != 0 ]
+then
+    Help
+    exit 3
+fi
+
+ACTION="fsr"    # Define operations by default
+L_OPT=0         # Save to log?
+S_OPT=0         # Save raw data?
+A_OPT=0         # Get data by valuedb instead by airviro distribution
+d_OPT=0		# show exec to stderr for debug
+E_OPT=0		# must use end time for fetch
+
+for i in $*
+do
+    case $i in
+        -h) Help all;;
+        -s) S_OPT=1; shift;;
+        -l) L_OPT=1; shift;;
+        -a) A_OPT=1; shift;;
+	-d) d_OPT=1; shift;;
+        -L) List ;;
+        -V) Verify ;;
+	-e) E_OPT=1; ENDTIME=$2; shift 2;;
+        -D) ACTION=$2; shift 2;;
+        -A) exit 0 ;;
+        -S) exit 0 ;;
+        --) shift; break;;
+    esac
+done
+
+if [ $d_OPT -eq 1 ]; then
+    set -x
+fi
+
+if [ `expr index "$ACTION" D` -eq 0 ] ; then
+    if [ $# -lt 3 ]; then
+        Help
+        exit 3
+    fi
+fi
+
+if [ $# -lt 3 ]; then
+    Help
+    exit 3
+fi
+
+DEVICE=$1
+STN=$2
+STARTTIME=$3
+if [ "$E_OPT" == "0" ]; then
+    ENDTIME=`mkstrftime "%y%m%d%H%M"`
+fi
+DATAFILES="$STN.data.*"
+RAWDATAFILES="$STN.raw.*"
+LOGFILE="${DBP}stn/$STN.log"
+TMPFILES="$STN.tmp"
+UNPACKDIR="${STN}fetch"
+
+LOCDIR="${DBP}tmp/"
+cd $LOCDIR
+if [ $? -ne 0 ]; then
+    $ECHO "Xpr\nCan't change to dir $LOCDIR"
+    exit 3
+fi
+
+if [ "$terminal" -eq 0 -o "$L_OPT" -eq 1 ] ; then
+    exec 2>/usr/airviro/log/${STN}.tmp
+fi
+
+DEBUG_LVL=`/usr/airviro/bin/getxpr $PROT $STN Verbose`
+qr=$?
+if [ $qr -eq 0 ]; then
+	DEBUG_LVL=0
+elif [ $qr -eq -1 -o $qr -eq 255 ]; then
+	$ECHO "Cfg\n$DEBUG_LVL"
+	DBGLVL=$DEBUG_LVL
+	DEBUG_LVL=1
+	NoticeMsg "$DBGLVL"
+	exit 3
+fi
+
+NoticeMsg `mkstrftime 'Start at %Y-%m-%d %H:%M'`
+NoticeMsg "with arguments: $@"
+
+if [ "${STARTTIME:8:2}" == "60" ]; then
+    STARTTIME=$(mkstrftime "%${STARTTIME:0:2}y%${STARTTIME:2:2}m%${STARTTIME:4:2}d%${STARTTIME:6:2}H%${STARTTIME:8:2}M")
+    NoticeMsg "Start time patched to $STARTTIME"
+fi
+if [ "${ENDTIME:8:2}" == "60" ]; then
+    ENDTIME=$(mkstrftime "%${ENDTIME:0:2}y%${ENDTIME:2:2}m%${ENDTIME:4:2}d%${ENDTIME:6:2}H%${ENDTIME:8:2}M")
+    NoticeMsg "End time patched to $ENDTIME"
+fi
+
+TRANS=`/usr/airviro/bin/getxpr $PROT $STN trans`
+DISTR=`/usr/airviro/bin/getxpr $PROT $STN distribution`
+if [ "$DISTR" == "0" ]; then
+	A_OPT=1
+	DebugMsg "Distribution disabled in cfg file"
+fi
+
+if [ "$TRANS" == "1" ]; then
+    DebugMsg "Transfer mode: RECEIVE"
+	
+    if action f $ACTION ; then
+        echo $DATAFILES | xargs rm -f
+        echo $RAWDATAFILES | xargs rm -f
+        Receive
+    else
+        EXITCODE=0
+    fi
+    if action s $ACTION ; then
+        Spool
+    fi
+    if [ $S_OPT -eq 1 ]; then
+        SaveRawData
+    fi
+    if action D $ACTION; then
+        ShowData
+    fi
+
+elif [ "$TRANS" == "2" ]; then
+    DebugMsg "Transfer mode: SEND"
+	
+    if action f $ACTION ; then
+        echo $DATAFILES | xargs rm -f
+        echo $RAWDATAFILES | xargs rm -f
+        rm -f -R $UNPACKDIR
+        if [ $A_OPT -eq 0 ]; then
+        # Using airviro distribution  
+            Fetch
+        else
+        # using valuedb 
+            AlternativeFetch
+        fi
+    else
+        EXITCODE=0
+    fi
+    if action s $ACTION ; then
+        Send
+    fi
+    if action D $ACTION; then
+        ShowData
+    fi
+else
+    $ECHO "Cfg\nUnknown transfer mode: $TRANS. Is defined $STN?"
+    NoticeMsg "Failed: Unknown transfer mode: $TRANS"
+    exit 3
+fi
+
+case $EXITCODE in
+0)
+    $ECHO $UPDATE
+    $ECHO $UPDATE
+    NoticeMsg "OK: $UPDATE"
+    ;;
+1)
+    $ECHO Again:$STARTTIME
+    $ECHO some data collected $UPDATE
+    NoticeMsg "Partial: Again: $STARTTIME - $UPDATE"
+    ;;
+2)
+    $ECHO $STARTTIME
+    $ECHO $STARTTIME
+    NoticeMsg "NO DATA: Again recollect $STARTTIME"
+    ;;
+*)
+    $ECHO "$EXSTR"
+    NoticeMsg "Failed: $EXITCODE\n$EXSTR"
+    ;;
+esac
+
+END_TIME=`date +"%s"`
+NoticeMsg "exec time:$(($END_TIME-$INIT_TIME)) seg"
+
+if action r $ACTION ; then
+    Cleanup
+fi
+
+exit $EXITCODE

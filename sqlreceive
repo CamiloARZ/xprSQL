@@ -1,0 +1,410 @@
+#!/usr/bin/env python
+# -*- coding: latin-1 -*-
+#
+# sqlreceive
+# Use:          sqlreceive <PROTOCOL> <STN> <STARTTIME> <ENDTIME>
+# Description:  Realize a connection to SQL database for to get data for an
+#               Airviro station for xprSql protocol
+# Author:       Carlos Mella (carlos.mella@r9.cl)
+#               R9 Ingenieria Ltda. (contactor9@r9.cl)
+#               Albert Parra (aparra@r9.cl)
+# Version:      2.0.0
+# Date:         November 2012
+
+import os
+import sys
+import sqlcommon
+import datetime
+import time
+import re
+######################
+import datetime as dt
+######################
+from datetime import date
+from datetime import time 
+###########################
+from time import strftime 
+# ****************************************************************************
+# Start of declarations of variables and functions
+
+def toLog(msg, showFile = True, line = None):
+    if showFile is True:
+        sys.stderr.write("\tFilename: %s\n" % os.path.basename(__file__))
+    if line is not None:
+        sys.stderr.write("\tLine number: %s\n" % line)
+    sys.stderr.write("%s\n" % msg)
+
+# Parser the line that describe a Subs from the .cfg file
+def splitSubValue(value):
+    try:
+        col, channel, type, KeyFlg, ChanUse, MinLim, MaxLim, strSelect = value.split(None, 7)
+
+        endSelectIndex = strSelect.rfind('#')
+        if endSelectIndex != -1:
+            unitValue = strSelect[endSelectIndex + 1:]
+            strSelect = strSelect[:endSelectIndex]
+        else:
+            unitValue = "0"
+    except:
+        sqlcommon.quit("Don't possible to parse the Data: %s" % value, sqlcommon.CFGBAD)
+
+    else:
+        return channel.strip(), strSelect.strip(), unitValue.strip()
+
+
+# Execute a SQL query and return an ad-hoc structure with the data obtained
+def exeReceiveSQLClient(starttime, endtime, strSelectDataFormat, dbParam, res, channel, cmdRetVal, dbId, entryId):
+    strSelect = strSelectDataFormat.replace(sqlcommon.cfgDataCtrl['time'], starttime)
+    strSelect = strSelect.replace(sqlcommon.cfgDataCtrl['etime'], endtime)
+    strReceive = "%s \"%s\"" % (dbParam['strCnx'], strSelect)
+
+    exe = os.popen(strReceive)
+    rawData = exe.readlines()
+    returnValue = exe.close()
+    cmdRetVal.append(returnValue)
+    rawDataToFile(rawData, dbId, entryId)
+    if returnValue is not None:
+        if returnValue == 127:
+            # 'sh: mysql: command not found'
+            sqlcommon.quit("SQL client isn't installed", XPRBAD)
+        else:
+            # TO DO: Separate for diferents value error
+            sqlcommon.error("Recollection of data for %s%s failed" %
+                            (sqlcommon.avTimeRes[res], channel))
+    return cleanSqlData(rawData, dbParam['engine'])
+
+
+# Parser the data obtained for the ejecution of SQL query
+def cleanSqlData(exe, engine):
+    sep = sqlcommon.columnSeparator[engine]
+    data = []
+    for line in exe:
+        record = line.split(sep)
+
+        if len(record) != 2 and len(record) != 3:
+            continue
+        else:
+            data.append(tuple([value.strip() for value in record]))
+    return data
+
+
+def rawDataToFile(rawData, dbId, entryId):
+    fileName = "%stmp/%s.raw.%s.%s" % (avdbname, stn, dbId, entryId)
+    try:
+        rawFile = open(fileName, "w")
+    except OSError:
+        sqlcommon.quit("Don't possible to create RAW file: %s" % fileName,
+                       sqlcommon.XPRBAD)
+    else:
+        for line in rawData:
+            rawFile.write("%s" % line)
+        rawFile.close()
+
+
+def strToDatetime(str, format):
+#     yyy = datetime.strptime(str, format)
+#     yyy = datetime.datetime(*time.strptime(str, format)[:6]))
+#     toLog("yyy : %s \n"  % yyy, "SQLRECEIVE",100) 
+#     toLog("yyy : %s \n"  % yyy, "SQLRECEIVE",100) 
+#    toLog("str : %s "  % str, "SQLRECEIVE",100)
+#    toLog("format : %s "  % format, "SQLRECEIVE",100)
+#    return datetime.datetime(*time.strptime(str, format)[:6])
+    return datetime.datetime.strptime(str, format).strftime("%Y-%m-%dT%H:%M") 
+#    rec = datetime.datetime.strptime(input,'%Y-%m-%dT%H:%M:%S')
+#    return rec.strftime("%Y-%m-%dT%H:%M")
+
+
+def translateData(data, dbData):
+    retrans = re.compile("Translation.*")
+    transData = []
+    transData = []
+    for key in dbData.keys():
+        if retrans.match(key):
+            if '$' not in dbData[key]:
+                sqlcommon.quit("Bad configuration of %s" % key, sqlcommon.CFGBAD)
+            airvVal, dbVal = dbData[key].split('$')
+            if ';' in airvVal:
+                avV, avS = airvVal.split(';')
+            else:
+                avV, avS = (airvVal, '')
+            if ';' in dbVal:
+                dbV, dbS = dbVal.split(';')
+            else:
+                dbV, dbS = (dbVal, '')
+            transData.append((avV, avS, dbV, dbS))
+    if len(transData) == 0:
+        return data
+    newData = {}
+    iter = 0
+    while iter < len(data):
+        if len(data[iter]) == 2:
+            ndV, ndS = (data[iter][1], '')
+        else:
+            ndV, ndS = (data[iter][1], data[iter][2])
+        for avV, avS, dbV, dbS in transData:
+            if dbV == data[iter][1] and dbS == data[iter][2]:
+                ndV, ndS = (avV, avS)
+                break
+        newData[iter] = [data[iter][0], ndV, ndS]
+        iter += 1
+    return newData
+
+
+def datetimeShift(datet, shift):
+    if shift == '0' or shift == None:
+        return datetime
+    datadt = datetime.datetime(*(time.strptime(datet, "%y%m%d%H%M")[0:6]))
+    newdt = datadt+datetime.timedelta(seconds=int(shift))
+    return newdt.strftime("%y%m%d%H%M")
+
+def cambiar(input):
+    # print(datetime.datetime.strptime(input, '%Y-%m-%d %H:%M:%S'))
+    if input != '':
+        rec = datetime.datetime.strptime(input, '%Y-%m-%dT%H:%M:%S')
+    else:
+        rec =''
+    return rec
+    #.strftime('%Y-%m-%d %H:%M')
+    # return datetime.datetime.strptime(input, '%Y-%m-%dT%H:%M:%S')#.strftime('%Y-%m-%d %H:%M')
+
+def cambiar2(input, format):
+    rec = datetime.datetime.strptime(input,'%Y-%m-%dT%H:%M:%S')
+    return rec.strftime(format)
+
+# ****************************************************************************
+# Main script starts here
+
+
+# Check for arguments, problem never occurs
+if len(sys.argv) != 5:
+    print "Xpr\n\
+sqlreceive missing arguments."
+    sys.exit(sqlcommon.XPRBAD)
+
+# Asigna argumentos a los parametros
+protocol, stn, starttime, endtime = sys.argv[1:]
+avdbname = os.environ["DBAS_PATH"]
+trans = 1               # 1: receive operation
+
+# Time resolution definedi in conf file
+cmd = "/usr/airviro/bin/getxpr -l %s %s.TimeRes" % (protocol, stn)
+TimeRes = sqlcommon.getxprDictionary(cmd)
+if len(TimeRes) == 0:
+    sqlcommon.quit("No TimeRes defined for %s" % stn, sqlcommon.CFGBAD)
+
+# Get all Data
+cmd = "/usr/airviro/bin/getxpr -l %s %s.Rcpt" % (protocol, stn)
+AllData = sqlcommon.getxprDictionary(cmd)
+if len(AllData) == 0:
+    sqlcommon.quit("No Rcpt data defined for %s" % stn, sqlcommon.CFGBAD)
+
+# Get timeres actually used in data, check for not defined TimeRes
+for key, val in AllData.items():
+    db, tr, id = key.split(".")
+    if tr not in TimeRes.keys():
+        sqlcommon.quit("Found Rcpt data with invalid TimeRes: %s" % tr, sqlcommon.CFGBAD)
+
+sqlData = {}    # Data by to obtain, for to write in airviro data files
+dbData = {}     # Data of each db used for connection
+goodCall = 0    # good data collection
+badCall = 0     # bad data collection
+
+# Read all the data
+for key, value in AllData.items():
+    db, tr, id = key.split(".")
+    channel, strSelect, unitValue = splitSubValue(value)
+    res = TimeRes[tr]
+
+    # If is the first time that is seen this db, get the string connection
+    # For next uses, get directly from strCnx dictionary
+    if db not in dbData.keys():
+        cmd = "/usr/airviro/bin/getxpr -l %s database.%s" % (protocol, db)
+        dbParam = sqlcommon.getxprDictionary(cmd)
+
+        if len(dbParam) == 0:
+            sqlcommon.quit("Database '%s' isn't defined" % db, sqlcommon.CFGBAD)
+
+        actualStrCnx = sqlcommon.getStrCnx(dbParam)
+        if actualStrCnx == "":
+            sqlcommon.quit("Engine '%s' not supported" % dbParam['engine'],  sqlcommon.CFGBAD)
+
+        dbData[db] = dbParam
+        dbData[db]['strCnx'] = actualStrCnx
+        # Time shift for database
+        dbData[db]['_DBRShift'] = 0
+        
+        if 'Zone' in dbData[db].keys():
+            toLog("Zone defined for db %s: %s" % (db, dbData[db]['Zone']), True, 217)
+            exe = os.popen('date +"%s"')
+            LTIME = exe.readline()
+            exe.close()
+            ltime = int(LTIME.strip())
+            exe = os.popen('date -d "$(/usr/sbin/zdump ' + dbData[db]['Zone'] + ' | awk \'{print $3, $4, $5, $6}\')" +"%s"')
+            ZTIME = exe.readline()
+            exe.close()
+            ztime = int(ZTIME.strip())
+            ZSHIFT=ltime-ztime
+            dbData[db]['_DBRShift'] += ZSHIFT
+         
+        if 'RcptShift' in dbData[db].keys():
+            toLog("RcptShift defined for db %s: %s" % (db, dbData[db]['RcptShift']), True, 217)
+            try:
+                dbData[db]['_DBRShift'] += int(dbData[db]['RcptShift'])
+            except exceptions.ValueError:
+                sqlcommon.quit("Value for Database.%s.RcptShift is not valid" % db, sqlcommon.XPRCFG)
+        
+        if dbData[db]['_DBRShift'] != 0:
+            toLog("Time Shift defined for receive: %s" % dbData[db]['_DBRShift'], True, 224)
+    
+    cmdretval = []
+    stimes = starttime
+    etimes = endtime
+    if dbData[db]['_DBRShift'] != 0:
+        stimes = datetimeShift(starttime, -1*dbData[db]['_DBRShift'])
+        etimes = datetimeShift(endtime,   -1*dbData[db]['_DBRShift'])
+    
+    data = exeReceiveSQLClient(stimes, etimes, strSelect, dbData[db], res, channel, cmdretval, db, id)
+    
+    if cmdretval[0] == 0 or  cmdretval[0] == None:
+        goodCall+=1
+    else:
+        badCall += 1
+        continue
+
+    if len(data) == 0:
+        continue
+
+    # Add data to sqlData, after referenced as sqlData[db][res][channel]
+    if db not in sqlData:
+        sqlData[db] = {}
+    
+    if res not in sqlData[db]:
+        sqlData[db][res] = {}
+
+    if channel in sqlData[db][res]:
+        sqlcommon.quit("Multiple Data define data for %s%s in db %s" % (sqlcommon.avTimeRes[res], channel, db), sqlcommon.CFGBAD)
+
+    for idb in sqlData.keys():
+        if channel in sqlData[idb][res]:
+            sqlcommon.quit("Multiple Data define data for %s%s in multiple DB" % (sqlcommon.avTimeRes[res], channel), sqlcommon.CFGBAD)
+    
+    sqlData[db][res][channel] = [data, unitValue]
+    
+if badCall > 0:
+    if goodCall == 0:
+        sqlcommon.quit("All calls failed", sqlcommon.STNBAD)
+
+if len(sqlData) == 0:
+    sqlcommon.quit(None, sqlcommon.NODATA)
+
+# Write Data File in Airviro format
+for idb, dbSqlData in sqlData.items():
+    countAvFiles = 1
+    for res, resSqlData in dbSqlData.items():
+        fileName = "%stmp/%s.data.%s.%d" % (avdbname, stn, idb, countAvFiles)
+        try:
+            avFile = open(fileName, "w")
+        except OSError:
+            sqlcommon.quit("Don't possible to create the file: %s" % fileName,sqlcommon.XPRBAD)
+        else:
+            avFile.write("%s%s\n" % (stn, sqlcommon.avTimeRes[res]))
+
+            countColumnHeadRaw = 1
+
+#           Escribe HEAD de archivo airviro data.x.x
+            for channel, (data, unitValue) in resSqlData.items():
+                print 'data =', len(data[0]) 
+                if len(data[0]) == 2:   # Columns: time, value
+                    avFile.write("%s %s 1 %s\n" % (countColumnHeadRaw, channel, unitValue))
+                    countColumnHeadRaw += 1
+                else:                   # Columns: time, value, status
+                    avFile.write("%s %s 1 %s\n%s %s 0 0\n" % (countColumnHeadRaw, channel, unitValue,countColumnHeadRaw + 1, channel))
+                    countColumnHeadRaw += 2
+            avFile.write("EOH\n")
+
+#           Escribe CUERPO de datos en archivo Airviro data.x.x
+#           firstTime = min([strToDatetime(data[0][0], "%Y-%m-%dT%H:%M:%S") for data in resSqlData.values()])
+            firstTime=cambiar(data[0][0]) 
+#           lastTime = max([strToDatetime(data[0][-1], "%Y-%m-%dT%H:%M:%s") for data in resSqlData.values()])
+            if (data[-1][0] == ''):
+                lastTime=cambiar(data[-2][0]) 
+            else:
+                lastTime=cambiar(data[-1][0]) 
+
+            toLog("Firsttime : %s LastTime: %s \n"  % (firstTime, lastTime), "SQLRECEIVE",301) 
+            resTime = datetime.timedelta(seconds=int(res))
+            toLog("resTime: %s  \n" % (resTime))
+            lastIndex = [0] * len(resSqlData)
+#            lastIndex = 0
+            print 'lastindex = ', lastIndex
+            print 'record  = ', data[lastIndex[0]]
+
+            while firstTime <= lastTime:
+                #avFile.write(firstTime.strftime("%y%m%d, %H%M"))
+                strTime = firstTime.strftime("%Y-%m-%dT%H:%M")
+                strTime_temp =firstTime.strftime("%H:%M:%S")
+		#delta = dt.timedelta(seconds=1800)
+		#toLog(delta)
+		#convert_strTime = datetime.datetime.strptime(strTime_temp,'%H:%M:%S').time()
+		#strTime_multiplo = (dt.datetime.combine(dt.date(1,1,1),convert_strTime) + delta).time()
+                print 'aqui se cae',  strTime
+                record = data[lastIndex[0]]
+                fecha = 0
+		#dt = cambiar2(record[0], "%H:%M:%S") dt es el alias de datetime esta explicado en el correo
+                toLog("strTime :%s *---------*  record: %s  \n" % (strTime,record)) 
+                for i, (data, unitValue) in enumerate(resSqlData.values()):
+                    try:
+                        record = data[lastIndex[i]]
+                        rec = cambiar2(record[0], "%Y-%m-%dT%H:%M")
+                        fecha_sql = cambiar2(record[0], "%y%m%d, %H%M")
+                        #hora_temp = cambiar2(record[0], "%H:%M:%S")#conversion para poder usar el delta
+		        #convert_rec = datetime.datetime.strptime(hora_temp,'%H:%M:%S').time()
+               	        #toLog(convert_rec) 
+			#hora_temp_multiplo = (dt.datetime.combine(dt.date(1,1,1),convert_rec) + delta).time())
+               	        #toLog("strTime_multiplo :%s *---------*  hora_temp_multiplo: %s  \n" % (strTime_multiplo,hora_temp_multiplo))
+			#toLog("hora_temp: %s ----- hora_temp_multiplo: %s \n" % (hora_temp,hora_temp_multiplo))
+ 
+#                        hora_anterior=datetime.datetime.strptime(dt,"%H:%M:%S").time()
+#                        multiplo = (datetime.datetime.combine(datetime.date(1,1,1),hora_anterior) + delta).time()
+#                        delta=cambiar(record[0])-hora_anterior
+                        #rec2 =datetime.datetime.strptime(dt,"%H:%M:%S").time() BD
+                       # d = datetime.datetime.combine(datetime.date(1,1,1), rec2) BD
+                       # toLog(" d : %s horaanterior: %s rec %s \n"  %  (d, rec2, rec), "SQLRECEIVE",318) 
+#                        delta = rec2.time()
+                        toLog("strTime: %s rec: %s \n"  %  (strTime, rec), "SQLRECEIVE",318) 
+			
+                          # multiplo = (datetime.datetime.combine(datetime.date(1,1,1),hora_anterior) + resTime).time()
+                          # toLog(" dt : %s horaanterior: %s multiplo: %s \n"  %  (dt, hora_anterior, multiplo), "SQLRECEIVE",318) 
+                        if rec == strTime:
+                            if fecha == 0:	
+                                avFile.write(firstTime.strftime("%y%m%d, %H%M"))
+                                fecha = 1	
+                            avFile.write(''.join([", %5s" % val for val in record[1:]]))
+                            lastIndex[i] += 1
+                          # hora_anterior=datetime.datetime.strptime(dt,"%H:%M:%S").time()
+                            toLog("lasindex : %s I:  %s record: %s  \n"  % (lastIndex, i, record[1:]), "SQLRECEIVE",328) 
+                        else:
+                            toLog("strTimeRROR: %s recERROR: %s \n"  %  (strTime, rec), "SQLRECEIVE",331)
+                            if fecha == 0:	
+                                avFile.write(firstTime.strftime("%y%m%d, %H%M"))
+                                fecha = 1	
+                            avFile.write(''.join([", %5s" % val for val in record[1:]]))
+			 #  raise IndexError
+                    except IndexError:
+                        numColumnsToShow = len(data[0]) - 1
+                        avFile.write(",     " * numColumnsToShow)
+                        lastIndex[i] += 1
+                        toLog("numColumsToShow : %s LastIndex: %s i: %s  \n"  % (numColumnsToShow, lastIndex, i), "SQLRECEIVE",338) 
+                        toLog("strTime: %s rec: %s \n"  %  (strTime, rec), "SQLRECEIVE",340) 
+
+                avFile.write("\n")
+                firstTime += resTime
+            avFile.write("EOF\n")
+
+            avFile.close()
+            countAvFiles += 1
+        
+if badCall > 0:
+    sqlcommon.quit(None, sqlcommon.AGAIN)
+else:
+    sqlcommon.quit()

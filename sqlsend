@@ -1,0 +1,313 @@
+#!/usr/bin/env python
+# -*- coding: latin-1 -*-
+#
+# sqlsend
+# Use:          sqlsend <PROTOCOL> <STN>
+# Description:  Search for airviro data files give for defined distribution and
+#               send data to a SQL database
+# Author:       Carlos Mella (carlos.mella@r9.cl)
+#               R9 Ingenieria Ltda. (contactor9@r9.cl)
+# Version:      1.0.2
+# Date:         January 2010
+
+import os
+import sys
+import sqlcommon
+import datetime
+import time
+import re
+
+# Parse an airviro data files. 
+# Return an ad-hoc structure with the data
+INVALIDSTATUSPOS = -1
+
+def toLog(msg, showFile = True, line = None):
+    if showFile is True:
+        sys.stderr.write("\tFilename: %s\n" % os.path.basename(__file__))
+    if line is not None:
+        sys.stderr.write("\tLine number: %s\n" % line)
+    sys.stderr.write("%s\n" % msg)
+
+def parseAvFile(file):
+    try:
+        f = open(file, "r")
+    except OSError, (errno, strerror):
+        sqlcommon.quit("Don't possible to open the file: %s" % file, 
+                       sqlcommon.SYSBAD)
+    else:
+        lineTopRaw = f.readline()
+        avStn = lineTopRaw[:3]
+        avRes = lineTopRaw[3:4]
+        avDataColumns = {}
+        numDataColumns = 0
+        lineHeadRaw = f.readline().rstrip()
+        while lineHeadRaw != "EOH":
+            rowData = lineHeadRaw.split(None, 3)
+            avCount, avChannel, avColumn = rowData[:3]
+            avCount, avColumn = int(avCount), int(avColumn)
+            if avColumn == 0:
+                posColumn = avCount + 1
+                if avChannel not in avDataColumns:
+                    avDataColumns[avChannel] = [0, posColumn]
+                else:
+                    avDataColumns[avChannel][1] = posColumn
+            else:
+                posColumn = avCount + avColumn
+                if avChannel not in avDataColumns:
+                    avDataColumns[avChannel] = [posColumn, INVALIDSTATUSPOS]
+                else:
+                    avDataColumns[avChannel][0] = posColumn
+            
+            numDataColumns += 1
+            lineHeadRaw = f.readline().rstrip()
+        
+        sqlDataRes = dict([ (channel, []) for channel in avDataColumns.keys()])
+        
+        lineBodyRaw = f.readline().rstrip()
+        while lineBodyRaw != "EOF":
+            rowData = lineBodyRaw.split(",", numDataColumns + 1)
+            rowData = [v.strip() for v in rowData]
+            rowData[-1] = rowData[-1].split(None, 1)[0].split(",", 1)[0]
+            
+            actualTime = rowData[0] + rowData[1]
+            if actualTime[8:10] == '60' or actualTime[6:10] == '2400':
+                tempTime = datetime.timedelta(hours=int(actualTime[6:8]),
+                                              minutes=int(actualTime[8:10]))
+                tempDateTime = datetime.datetime(*time.strptime(actualTime[:6],
+                                                                "%y%m%d")[:3]) \
+                               + tempTime
+                actualTime = tempDateTime.strftime("%y%m%d%H%M")
+                
+            for channel in avDataColumns.keys():
+                posValue, posStatus = avDataColumns[channel]
+                actualValue = rowData[posValue]
+                actualStatus = INVALIDSTATUSVALUE
+                if posStatus != INVALIDSTATUSPOS:
+                    actualStatus = rowData[posStatus]
+                
+                if actualValue != "" and actualStatus != '0':
+                    sqlDataRes[channel].append((actualTime,
+                                                actualValue,
+                                                actualStatus))
+                
+            lineBodyRaw = f.readline().rstrip()
+        
+        f.close()
+        return avStn, avRes, sqlDataRes
+
+CFGJOKER = "%"
+cfgFieldCtrl = ["@STN@", "@RES@", "@CHANNEL@"]
+INVALIDSTATUSVALUE = "Null"
+
+def getFieldList(field, fieldData):
+    if field != CFGJOKER:
+        if field in fieldData:
+            return [field]
+        else:
+            return []
+    else:
+        return fieldData.keys()
+
+def splitSubValue(value):
+    try:
+        dstn, channel, type, KeyFlg, ChanUse, MinLim, MaxLim, strSelect = value.split(None, 7)
+        endSelectIndex = strSelect.rfind('#')
+        if endSelectIndex != -1:
+            unitValue = strSelect[endSelectIndex + 1:]
+            strSelect = strSelect[:endSelectIndex]
+        else:
+            unitValue = "0"
+    except:
+        sqlcommon.quit("Don't possible to parse the Subs: %s" % value, sqlcommon.CFGBAD)
+    else:
+        return dstn.strip(), channel.strip(), strSelect.strip()
+
+
+maxInsertInCmdLine = 200
+
+def exeSendSqlClient(data, strInsertDataFormat, strCnx):
+    iter = 0
+    while iter < len(data):
+        actualStrInsert = ""
+        while True:
+            record = data[iter]
+            recordInsert = strInsertDataFormat[:]
+            for ctrlValue, recordValue in zip(sqlcommon.cfgSentDataCtrl, record):
+                recordInsert = recordInsert.replace(ctrlValue, recordValue)
+            
+            actualStrInsert += recordInsert
+            iter += 1
+            if iter >= len(data) or iter % maxInsertInCmdLine == 0:
+                break
+        
+        exe = os.popen("%s \"%s\"" % (strCnx, actualStrInsert))
+        returnValue = exe.close()
+        if returnValue is not None:
+            if returnValue != 0:
+                sqlcommon.error(
+                    "Sending of data for %s %s%s of Subs %s failed" %
+                    (actualDstn, sqlcommon.avTimeRes[actualRes],
+                    actualChannel, id))
+                return
+    
+def printSqlData(sqlData):
+    for aStn in sqlData.keys():
+        for aRes in sqlData[aStn].keys():
+            for aChannel in sqlData[aStn][aRes].keys():
+                channelSqlData = sqlData[aStn][aRes][aChannel]
+                for aaTime, aaValue, aaStatus in channelSqlData:
+                    toLog("[%s, %s, %s]" % (aaTime, aaValue, aaStatus), False)
+
+
+def timeShift(data, shift):
+    if shift == '0' or shift == None:
+        return data
+    iter = 0
+    newData = {}
+    while iter < len(data):
+        datadt = datetime.datetime(*(time.strptime(data[iter][0], "%y%m%d%H%M")[0:6]))
+        newdt = datadt+datetime.timedelta(seconds=int(shift))
+        newData[iter] = [newdt.strftime("%y%m%d%H%M"), data[iter][1], data[iter][2]]
+        iter += 1
+    
+    return newData
+        
+def translateData(data, dbData):
+    retrans = re.compile("Translation.*")
+    transData = []
+    for key in dbData.keys():
+        if retrans.match(key):
+            if '$' not in dbData[key]:
+                sqlcommon.quit("Bad configuration of %s" % key, sqlcommon.CFGBAD)
+                airvVal, dbVal = dbData[key].split('$')
+            if ';' in airvVal:
+                avV, avS = airvVal.split(';')
+            else:
+                avV, avS = (airvVal, '')
+            if ';' in dbVal:
+                dbV, dbS = dbVal.split(';')
+            else:
+                dbV, dbS = (dbVal, '')
+                transData.append((avV, avS, dbV, dbS))
+    if len(transData) == 0:
+        return data
+    newData = {}
+    iter = 0
+    while iter < len(data):
+        ndV, ndS = (data[iter][1], data[iter][2])
+        for avV, avS, dbV, dbS in transData:
+            if avV == data[iter][1] and avS == data[iter][2]:
+                ndV, ndS = (dbV, dbS)
+                break
+        newData[iter] = [data[iter][0], ndV, ndS]
+        iter += 1
+    return newData
+
+# Check for arguments, problem never should occurs
+if len(sys.argv) != 3:
+    print "sqlsend\n\
+Script used for the xprSql protocol."
+    sys.exit(255)
+
+protocol, stn = sys.argv[1:]
+trans = 2               # 2: send operation
+
+
+# Format for filenames of airviro data files to send
+avFileName = "%s.data.*" % stn
+
+# Get names for files to get data for send
+# TO DO: Filter directories and unknown files with similar name
+cmdListFiles = "ls -1 -F %s" % (avFileName)
+exe = os.popen(cmdListFiles).readlines()
+avFiles = [line.rstrip() for line in exe]
+
+if len(avFiles) == 0:
+    sqlcommon.quit(None, sqlcommon.NODATA)
+
+# Data by to obtain from airviro data files for to send
+sqlData = {}
+
+for file in avFiles:
+    avStn, avRes, resSqlData = parseAvFile(file)
+    avRes = sqlcommon.avResToTimeRes[avRes]
+
+    # Add resSqlData to sqlData
+    if avStn not in sqlData:
+        sqlData[avStn] = { avRes: resSqlData}
+    elif avRes not in sqlData[avStn]:
+        sqlData[avStn][avRes] = resSqlData
+    else:
+        destResSqlData = sqlData[avStn][avRes]
+        for channel in resSqlData:
+            if channel not in destResSqlData:
+                destResSqlData[channel] = resSqlData[channel]
+            else:
+                destResSqlData[channel].extend(resSqlData[channel])
+
+printSqlData(sqlData)
+
+# Time resolution defined
+cmd = "/usr/airviro/bin/getxpr -l %s %s.TimeRes" % (protocol, stn)
+TimeRes = sqlcommon.getxprDictionary(cmd)
+if len(TimeRes) == 0:
+    sqlcommon.quit("No TimeRes defined for %s" % stn, sqlcommon.CFGBAD)
+
+# Get all data (for sent, ie STN.Sent.x.x.)
+cmd = "/usr/airviro/bin/getxpr -l %s %s.Sent" % (protocol, stn)
+AllData = sqlcommon.getxprDictionary(cmd)
+if len(AllData) == 0:
+    sqlcommon.quit("No Sent data defined for %s" % stn, sqlcommon.CFGBAD)
+
+dbData = {}     # Data of each db used for connection
+
+for key, value in AllData.items():
+    db, tr, id = key.split(".")
+    dstn, channel, strInsertFormat = splitSubValue(value)
+    res = TimeRes[tr]
+
+    # If is the first time that is seen this db, get the string connection
+    # For next uses, get directly from strCnx dictionary
+    if db not in dbData.keys():
+        cmd = "/usr/airviro/bin/getxpr -l %s database.%s" % (protocol, db)
+        dbParam = sqlcommon.getxprDictionary(cmd)
+        if len(dbParam) == 0:
+            sqlcommon.quit("Database '%s' isn't defined" % db, sqlcommon.CFGBAD)
+ 
+        actualStrCnx = sqlcommon.getStrCnx(dbParam)
+        if actualStrCnx == "":
+            sqlcommon.quit("Engine '%s' not supported" % dbParam['engine'], sqlcommon.CFGBAD)
+
+        dbData[db] = dbParam
+        dbData[db]['strCnx'] = actualStrCnx
+    
+    if strInsertFormat[-1] != ";":
+        strInsertFormat += ";"
+    
+    dstnList = getFieldList(dstn, sqlData)
+
+    for actualDstn in dstnList:
+        dstnData = sqlData[actualDstn]
+        
+        resList = getFieldList(res, dstnData)
+        for actualRes in resList:
+            resData = dstnData[actualRes]
+            channelList = getFieldList(channel, resData)
+            for actualChannel in channelList:
+
+                data = resData[actualChannel]
+                if len(data) == 0:
+                    continue
+                
+                dataField = [actualDstn, actualRes, actualChannel]
+                
+                strInsert = strInsertFormat[:]
+                for field, dataValue in zip(cfgFieldCtrl, dataField):
+                    strInsert = strInsert.replace(field, dataValue)
+                
+                sdata = timeShift(data, dbData[db]['SentShift'])
+                sdata = translateData(sdata, dbData[db])
+                exeSendSqlClient(sdata, strInsert, dbData[db]['strCnx'])
+                
+sqlcommon.quit()
+
